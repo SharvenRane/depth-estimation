@@ -1,51 +1,59 @@
+"""A small encoder decoder for monocular depth estimation.
+
+The network takes a 3 channel image and predicts a single channel depth map at
+the same spatial resolution as the input. It is deliberately compact so it runs
+quickly on CPU and trains in a handful of steps on synthetic data.
 """
-Depth Estimation - Model Architecture
-"""
+
 import torch
 import torch.nn as nn
-import timm
-from einops import rearrange
 
 
-class DepthEstimation(nn.Module):
+def _conv_block(in_ch, out_ch):
+    return nn.Sequential(
+        nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1),
+        nn.BatchNorm2d(out_ch),
+        nn.ReLU(inplace=True),
+        nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1),
+        nn.BatchNorm2d(out_ch),
+        nn.ReLU(inplace=True),
+    )
+
+
+class DepthNet(nn.Module):
+    """U-Net style encoder decoder with skip connections.
+
+    The output is a single channel depth map with the same height and width as
+    the input image. The model predicts depth in log space and the head applies
+    no activation so values can be any real number, which pairs naturally with
+    the scale invariant loss that operates in log space.
     """
-    Main model for depth estimation.
-    """
 
-    def __init__(self, config):
+    def __init__(self, in_channels=3, base_channels=16):
         super().__init__()
-        self.config = config
-        self.encoder = timm.create_model(
-            config.backbone,
-            pretrained=config.pretrained,
-            features_only=True
-        )
-        self.head = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Flatten(),
-            nn.Linear(self.encoder.feature_info[-1]["num_chs"], config.num_classes)
-        )
+        c = base_channels
+
+        self.enc1 = _conv_block(in_channels, c)
+        self.enc2 = _conv_block(c, c * 2)
+        self.pool = nn.MaxPool2d(2)
+
+        self.bottleneck = _conv_block(c * 2, c * 4)
+
+        self.up2 = nn.ConvTranspose2d(c * 4, c * 2, kernel_size=2, stride=2)
+        self.dec2 = _conv_block(c * 4, c * 2)
+        self.up1 = nn.ConvTranspose2d(c * 2, c, kernel_size=2, stride=2)
+        self.dec1 = _conv_block(c * 2, c)
+
+        self.head = nn.Conv2d(c, 1, kernel_size=1)
 
     def forward(self, x):
-        features = self.encoder(x)
-        out = self.head(features[-1])
-        return out
+        e1 = self.enc1(x)
+        e2 = self.enc2(self.pool(e1))
+        b = self.bottleneck(self.pool(e2))
 
-    def extract_features(self, x):
-        features = self.encoder(x)
-        pooled = nn.functional.adaptive_avg_pool2d(features[-1], 1)
-        return pooled.flatten(1)
+        d2 = self.up2(b)
+        d2 = self.dec2(torch.cat([d2, e2], dim=1))
+        d1 = self.up1(d2)
+        d1 = self.dec1(torch.cat([d1, e1], dim=1))
 
-
-def build_model(config):
-    model = DepthEstimation(config)
-    if config.get("checkpoint"):
-        state = torch.load(config.checkpoint, map_location="cpu")
-        model.load_state_dict(state["model"])
-    return model
-
-# update 7
-
-# update 9
-
-# update 14
+        return self.head(d1)
